@@ -16,7 +16,7 @@ use ethers_core::utils::WEI_IN_ETHER;
 use futures_util::future::join_all;
 use tokio::join;
 use tokio::sync::Mutex;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use hyperlane_core::{
     rpc_clients::call_and_retry_indefinitely, utils::bytes_to_hex, BatchItem, BatchResult,
@@ -633,9 +633,30 @@ where
         // this function is used to get an accurate gas estimate for the transaction
         // rather than a gas amount that will guarantee inclusion, so we use `false`
         // for the `with_gas_estimate_buffer` arg in `process_contract_call`
-        let contract_call = self
+        let gas_limit_override = self.conn.transaction_overrides.gas_limit;
+        let contract_call = match self
             .process_contract_call(message, metadata, None, false)
-            .await?;
+            .await
+        {
+            Ok(contract_call) => contract_call,
+            Err(err) => {
+                let Some(gas_limit_override) = gas_limit_override else {
+                    return Err(err);
+                };
+
+                warn!(
+                    error = ?err,
+                    ?gas_limit_override,
+                    "Falling back to configured gas limit for process cost estimation"
+                );
+
+                let contract_call = self
+                    .process_contract_call(message, metadata, Some(gas_limit_override), false)
+                    .await?;
+                contract_call.call().await?;
+                contract_call
+            }
+        };
         let gas_limit = contract_call
             .tx
             .gas()
@@ -740,6 +761,28 @@ mod test {
             transaction_overrides: Default::default(),
             op_submission_config: Default::default(),
         };
+
+        let mailbox = EthereumMailbox::new(
+            provider.clone(),
+            &connection_conf,
+            &ContractLocator {
+                domain: &domain,
+                // Address doesn't matter because we're using a MockProvider
+                address: H256::default(),
+            },
+        );
+        (mailbox, mock_provider)
+    }
+
+    fn get_test_mailbox_with_connection_conf(
+        domain: HyperlaneDomain,
+        connection_conf: ConnectionConf,
+    ) -> (
+        EthereumMailbox<Provider<Arc<MockProvider>>>,
+        Arc<MockProvider>,
+    ) {
+        let mock_provider = Arc::new(MockProvider::new());
+        let provider = Arc::new(Provider::new(mock_provider.clone()));
 
         let mailbox = EthereumMailbox::new(
             provider.clone(),
@@ -881,6 +924,64 @@ mod test {
             TxCostEstimate {
                 // The block gas limit is the cap
                 gas_limit: latest_block_gas_limit,
+                gas_price: gas_price.try_into().unwrap(),
+                l2_gas_limit: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_estimate_costs_falls_back_to_configured_gas_limit() {
+        let domain = HyperlaneDomain::Known(KnownHyperlaneDomain::Ethereum);
+        let gas_limit_override = U256::from(2_000_000u32);
+        let gas_price: U256 =
+            EthersU256::from(ethers::utils::parse_units("15", "gwei").unwrap()).into();
+        let connection_conf = ConnectionConf {
+            rpc_connection: RpcConnectionConf::Http {
+                url: "http://127.0.0.1:8545".parse().unwrap(),
+            },
+            transaction_overrides: crate::TransactionOverrides {
+                gas_limit: Some(gas_limit_override),
+                gas_price: Some(gas_price),
+                ..Default::default()
+            },
+            op_submission_config: Default::default(),
+        };
+        let (mailbox, mock_provider) =
+            get_test_mailbox_with_connection_conf(domain, connection_conf);
+
+        let message = HyperlaneMessage::default();
+        let metadata: Vec<u8> = vec![];
+
+        // The MockProvider responses we push are processed in LIFO order.
+        // RPC 4: eth_gasPrice by process_estimate_costs
+        mock_provider.push(gas_price).unwrap();
+
+        // RPC 3: eth_call verifies the configured-gas fallback still simulates.
+        mock_provider.push::<String, _>("0x".to_string()).unwrap();
+
+        let latest_block: Block<Transaction> = Block {
+            gas_limit: ethers::types::U256::MAX,
+            ..Block::<Transaction>::default()
+        };
+
+        // RPC 2: eth_getBlockByNumber from the fallback fill_tx_gas_params call
+        mock_provider.push(latest_block).unwrap();
+
+        // RPC 1: eth_estimateGas from the initial process_contract_call attempt.
+        mock_provider
+            .push::<String, _>("bogus".to_string())
+            .unwrap();
+
+        let tx_cost_estimate = mailbox
+            .process_estimate_costs(&message, &metadata)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tx_cost_estimate,
+            TxCostEstimate {
+                gas_limit: gas_limit_override,
                 gas_price: gas_price.try_into().unwrap(),
                 l2_gas_limit: None,
             },
