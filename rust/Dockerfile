@@ -11,7 +11,7 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     rustup target add x86_64-unknown-linux-musl && \
-    cargo install --locked sccache
+    cargo install --locked --version 0.11.0 sccache
 
 # Configure sccache for faster builds
 # https://github.com/mozilla/sccache

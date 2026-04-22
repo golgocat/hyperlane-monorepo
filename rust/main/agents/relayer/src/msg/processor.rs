@@ -110,13 +110,52 @@ impl ForwardBackwardIterator {
                 }
 
                 // If both iterators give us unindexed messages, there are no messages at the moment
-                (MessageStatus::Unindexed, MessageStatus::Unindexed) => return Ok(None),
+                (MessageStatus::Unindexed, MessageStatus::Unindexed) => {
+                    if self.refresh_high_nonce()? {
+                        continue;
+                    }
+                    return Ok(None);
+                }
             }
             // This loop may iterate through millions of processed messages, blocking the runtime.
             // So, to avoid starving other futures in this task, yield to the runtime
             // on each iteration
             tokio::task::yield_now().await;
         }
+    }
+
+    fn refresh_high_nonce(&mut self) -> Result<bool> {
+        let Some(latest_high_nonce) = self
+            .high_nonce_iter
+            .db
+            .retrieve_highest_seen_message_nonce()?
+        else {
+            return Ok(false);
+        };
+
+        let current_high_nonce = self.high_nonce_iter.nonce.unwrap_or_default();
+        if latest_high_nonce <= current_high_nonce {
+            return Ok(false);
+        }
+
+        self.high_nonce_iter.nonce = Some(latest_high_nonce);
+        if let Some(new_low_nonce) = latest_high_nonce.checked_sub(1) {
+            self.low_nonce_iter.nonce = Some(
+                self.low_nonce_iter
+                    .nonce
+                    .map_or(new_low_nonce, |current| current.max(new_low_nonce)),
+            );
+        }
+
+        debug!(
+            current_high_nonce,
+            latest_high_nonce,
+            low_nonce = ?self.low_nonce_iter.nonce,
+            domain = %self._domain,
+            "Refreshed ForwardBackwardIterator bounds"
+        );
+
+        Ok(true)
     }
 }
 
@@ -878,5 +917,43 @@ pub mod test {
             forward_backward_iterator.high_nonce_iter.nonce,
             Some(MAX_ONCHAIN_NONCE + 1)
         );
+    }
+
+    #[tokio::test]
+    async fn test_forward_backward_iterator_refreshes_after_startup_gap() {
+        test_utils::run_test_db(|db| async move {
+            let origin_domain = dummy_domain(0, "dummy_origin_domain");
+            let destination_domain = dummy_domain(1, "dummy_destination_domain");
+            let db = HyperlaneRocksDB::new(&origin_domain, db);
+            let dummy_metrics = dummy_processor_metrics(destination_domain.id());
+
+            let mut forward_backward_iterator =
+                ForwardBackwardIterator::new(Arc::new(db.clone()) as Arc<dyn HyperlaneDb>);
+
+            assert_eq!(
+                forward_backward_iterator
+                    .try_get_next_message(&dummy_metrics)
+                    .await
+                    .unwrap(),
+                None
+            );
+
+            add_db_entry(&db, &dummy_hyperlane_message(&destination_domain, 2), 0);
+            add_db_entry(&db, &dummy_hyperlane_message(&destination_domain, 3), 0);
+
+            let first = forward_backward_iterator
+                .try_get_next_message(&dummy_metrics)
+                .await
+                .unwrap()
+                .unwrap();
+            let second = forward_backward_iterator
+                .try_get_next_message(&dummy_metrics)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!((first.nonce, second.nonce), (3, 2));
+        })
+        .await;
     }
 }
