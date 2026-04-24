@@ -26,6 +26,8 @@ pub struct Server {
     op_queues: Option<HashMap<u32, OperationPriorityQueue>>,
     #[new(default)]
     dbs: Option<HashMap<u32, HyperlaneRocksDB>>,
+    #[new(default)]
+    max_message_retries: Option<u32>,
 }
 
 impl Server {
@@ -47,6 +49,11 @@ impl Server {
         self
     }
 
+    pub fn with_max_message_retries(mut self, max_message_retries: u32) -> Self {
+        self.max_message_retries = Some(max_message_retries);
+        self
+    }
+
     // return a custom router that can be used in combination with other routers
     pub fn router(self) -> Router {
         let mut router = Router::new();
@@ -56,8 +63,16 @@ impl Server {
                 operations::message_retry::ServerState::new(tx, self.destination_chains).router(),
             )
         }
-        if let Some(op_queues) = self.op_queues {
+        if let Some(op_queues) = self.op_queues.clone() {
             router = router.merge(operations::list_messages::ServerState::new(op_queues).router());
+        }
+        if let (Some(op_queues), Some(dbs), Some(max_message_retries)) =
+            (self.op_queues, self.dbs.clone(), self.max_message_retries)
+        {
+            router = router.merge(
+                operations::message_skip::ServerState::new(op_queues, dbs, max_message_retries)
+                    .router(),
+            );
         }
         if let Some(dbs) = self.dbs {
             router = router

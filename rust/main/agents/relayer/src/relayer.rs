@@ -700,6 +700,7 @@ impl BaseAgent for Relayer {
             .with_op_retry(sender.clone())
             .with_message_queue(prep_queues)
             .with_dbs(dbs)
+            .with_max_message_retries(self.max_retries)
             .router();
 
         let server = self
