@@ -657,11 +657,24 @@ where
                 contract_call
             }
         };
-        let gas_limit = contract_call
+        let mut gas_limit = contract_call
             .tx
             .gas()
             .copied()
             .ok_or(HyperlaneProtocolError::ProcessGasLimitRequired)?;
+        if self.domain.id() == 1_337_090 {
+            let gas_limit_cap: Option<ethers::types::U256> = gas_limit_override.map(Into::into);
+            if let Some(gas_limit_cap) = gas_limit_cap {
+                if gas_limit > gas_limit_cap {
+                    warn!(
+                        ?gas_limit,
+                        ?gas_limit_cap,
+                        "Capping PRMX process gas estimate to configured gas limit"
+                    );
+                    gas_limit = gas_limit_cap;
+                }
+            }
+        }
 
         // If we have a ArbitrumNodeInterface, we need to set the l2_gas_limit.
         let l2_gas_limit = if let Some(arbitrum_node_interface) = &self.arbitrum_node_interface {
@@ -740,8 +753,9 @@ mod test {
     };
     use ethers_core::types::FeeHistory;
     use hyperlane_core::{
-        ContractLocator, HyperlaneDomain, HyperlaneMessage, KnownHyperlaneDomain, Mailbox,
-        TxCostEstimate, H160, H256, U256,
+        ContractLocator, HyperlaneDomain, HyperlaneDomainProtocol, HyperlaneDomainTechnicalStack,
+        HyperlaneDomainType, HyperlaneMessage, KnownHyperlaneDomain, Mailbox, TxCostEstimate, H160,
+        H256, U256,
     };
 
     use crate::{contracts::EthereumMailbox, ConnectionConf, RpcConnectionConf};
@@ -972,6 +986,65 @@ mod test {
         mock_provider
             .push::<String, _>("bogus".to_string())
             .unwrap();
+
+        let tx_cost_estimate = mailbox
+            .process_estimate_costs(&message, &metadata)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tx_cost_estimate,
+            TxCostEstimate {
+                gas_limit: gas_limit_override,
+                gas_price: gas_price.try_into().unwrap(),
+                l2_gas_limit: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prmx_process_estimate_costs_caps_to_configured_gas_limit() {
+        let domain = HyperlaneDomain::Unknown {
+            domain_id: 1_337_090,
+            domain_name: "prmx".to_string(),
+            domain_type: HyperlaneDomainType::Testnet,
+            domain_protocol: HyperlaneDomainProtocol::Ethereum,
+            domain_technical_stack: HyperlaneDomainTechnicalStack::Other,
+        };
+        let gas_limit_override = U256::from(15_000_000u32);
+        let gas_price: U256 =
+            EthersU256::from(ethers::utils::parse_units("15", "gwei").unwrap()).into();
+        let connection_conf = ConnectionConf {
+            rpc_connection: RpcConnectionConf::Http {
+                url: "http://127.0.0.1:8545".parse().unwrap(),
+            },
+            transaction_overrides: crate::TransactionOverrides {
+                gas_limit: Some(gas_limit_override),
+                gas_price: Some(gas_price),
+                ..Default::default()
+            },
+            op_submission_config: Default::default(),
+        };
+        let (mailbox, mock_provider) =
+            get_test_mailbox_with_connection_conf(domain, connection_conf);
+
+        let message = HyperlaneMessage::default();
+        let metadata: Vec<u8> = vec![];
+
+        // The MockProvider responses we push are processed in LIFO order.
+        // RPC 3: eth_gasPrice by process_estimate_costs.
+        mock_provider.push(gas_price).unwrap();
+
+        let latest_block: Block<Transaction> = Block {
+            gas_limit: EthersU256::from(75_000_000u32),
+            ..Block::<Transaction>::default()
+        };
+
+        // RPC 2: eth_getBlockByNumber from the fill_tx_gas_params call.
+        mock_provider.push(latest_block).unwrap();
+
+        // RPC 1: eth_estimateGas returns a PRMX Frontier overestimate.
+        mock_provider.push(U256::from(78_000_000u32)).unwrap();
 
         let tx_cost_estimate = mailbox
             .process_estimate_costs(&message, &metadata)
